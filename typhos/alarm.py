@@ -6,7 +6,7 @@ import logging
 import os
 from collections import defaultdict
 from dataclasses import dataclass
-from functools import partial
+from typing import Callable
 
 from ophyd.device import Kind
 from ophyd.signal import EpicsSignalBase
@@ -67,10 +67,26 @@ KIND_FILTERS = {
 @dataclass
 class SignalInfo:
     address: str
-    channel: PyDMChannel
     signal_name: str
     connected: bool
     severity: int
+    alarm_update_hook: Callable[[], None]
+
+    def __post_init__(self):
+        # Make the channel and set it up to use this object's slots
+        self.channel = PyDMChannel(
+            address=self.address,
+            connection_slot=self.update_connection,
+            severity_slot=self.update_severity,
+        )
+
+    def update_connection(self, conn: bool):
+        self.connected = conn
+        self.alarm_update_hook()
+
+    def update_severity(self, sevr: int):
+        self.severity = sevr
+        self.alarm_update_hook()
 
     @property
     def alarm(self) -> AlarmLevel:
@@ -183,20 +199,15 @@ class TyphosAlarm(TyphosObject, PyDMDrawing, _KindLevel, _AlarmLevel):
                     tx_slot=self._tx,
                 )
             else:
-                channel = PyDMChannel(
+                info = SignalInfo(
                     address=self._channel,
-                    connection_slot=partial(self.update_connection,
-                                            addr=self._channel),
-                    severity_slot=partial(self.update_severity,
-                                          addr=self._channel),
-                )
-                self.signal_info[self._channel] = SignalInfo(
-                    address=self._channel,
-                    channel=channel,
                     signal_name='',
                     connected=False,
                     severity=AlarmLevel.INVALID,
+                    alarm_update_hook=self.update_current_alarm,
                 )
+                self.signal_info[self._channel] = info
+                channel = info.channel
             self._channels = [channel]
             # Connect the channel to the HappiPlugin
             if hasattr(channel, 'connect'):
@@ -216,10 +227,7 @@ class TyphosAlarm(TyphosObject, PyDMDrawing, _KindLevel, _AlarmLevel):
         """
         Let pydm know about our pydm channels.
         """
-        ch = list(self._channels)
-        for info in self.signal_info.values():
-            ch.append(info.channel)
-        return ch
+        return list(self._channels)
 
     def add_device(self, device):
         """
@@ -232,8 +240,9 @@ class TyphosAlarm(TyphosObject, PyDMDrawing, _KindLevel, _AlarmLevel):
         """
         Reset this widget down to the "no alarm handling" state.
         """
-        for ch in (info.channel for info in self.signal_info.values()):
+        for ch in self.channels():
             ch.disconnect()
+        self._channels.clear()
         self.reset_alarm_state()
 
     def setup_alarm_config(self, device):
@@ -252,31 +261,25 @@ class TyphosAlarm(TyphosObject, PyDMDrawing, _KindLevel, _AlarmLevel):
         for sig in sigs:
             if not isinstance(sig, EpicsSignalBase):
                 register_signal(sig)
-        channels = [
-            PyDMChannel(
-                address=addr,
-                connection_slot=partial(self.update_connection, addr=addr),
-                severity_slot=partial(self.update_severity, addr=addr),
-            )
-            for addr in channel_addrs]
 
-        for ch, sig in zip(channels, sigs):
+        for ch_addr, sig in zip(channel_addrs, sigs):
             info = SignalInfo(
-                address=ch.address,
-                channel=ch,
+                address=ch_addr,
                 signal_name=sig.dotted_name,
                 connected=False,
                 severity=AlarmLevel.INVALID,
+                alarm_update_hook=self.update_current_alarm,
             )
-            self.signal_info[ch.address] = info
+            self.signal_info[ch_addr] = info
             self.device_info[device.name].append(info)
-            ch.connect()
+            self._channels.append(info.channel)
+            info.channel.connect()
 
         all_channels = self.channels()
         if all_channels:
             logger.debug(
                 f'Finished setup of alarm config for device {device.name} on '
-                f'alarm widget with channel {all_channels[0]}.'
+                f'alarm widget with new channels {channel_addrs}.'
             )
         else:
             logger.warning(
@@ -294,16 +297,6 @@ class TyphosAlarm(TyphosObject, PyDMDrawing, _KindLevel, _AlarmLevel):
         self.clear_all_alarm_configs()
         for dev in self.devices:
             self.setup_alarm_config(dev)
-
-    def update_connection(self, connected, addr):
-        """Slot that will be called when a PV connects or disconnects."""
-        self.signal_info[addr].connected = connected
-        self.update_current_alarm()
-
-    def update_severity(self, severity, addr):
-        """Slot that will be called when a PV's alarm severity changes."""
-        self.signal_info[addr].severity = severity
-        self.update_current_alarm()
 
     def update_current_alarm(self):
         """
