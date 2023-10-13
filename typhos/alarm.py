@@ -81,6 +81,7 @@ class SignalInfo:
         )
 
     def update_connection(self, conn: bool):
+        print(f"{self.address}, {conn}")
         self.connected = conn
         self.alarm_update_hook()
 
@@ -141,6 +142,7 @@ class TyphosAlarm(TyphosObject, PyDMDrawing, _KindLevel, _AlarmLevel):
         self.penStyle = Qt.SolidLine
         self.reset_alarm_state()
         self.alarm_changed.connect(self.set_alarm_color)
+        self.destroyed.connect(self.clear_all_alarm_configs)
 
     @QtCore.Property(_KindLevel)
     def kindLevel(self):
@@ -198,20 +200,41 @@ class TyphosAlarm(TyphosObject, PyDMDrawing, _KindLevel, _AlarmLevel):
                     address=self._channel,
                     tx_slot=self._tx,
                 )
-            else:
-                info = SignalInfo(
-                    address=self._channel,
-                    signal_name='',
-                    connected=False,
-                    severity=AlarmLevel.INVALID,
-                    alarm_update_hook=self.update_current_alarm,
-                )
-                self.signal_info[self._channel] = info
-                channel = info.channel
-            self._channels = [channel]
-            # Connect the channel to the HappiPlugin
-            if hasattr(channel, 'connect'):
                 channel.connect()
+            else:
+                self.add_channel(address=self._channel, signal_name=self._channel)
+
+    def add_channel(self, address: str, signal_name: str) -> SignalInfo:
+        """
+        Add one (non-happi) channel to the alarm widget.
+
+        This is called internally for each individual PV or signal
+        found in a device, and also when setting a singular widget
+        channel.
+
+        Parameters
+        ----------
+        address: str
+            The channel address to include for PyDM, e.g. ca://something
+        signal_name: str
+            An identifying name to use for debug purposes.
+
+        Returns
+        -------
+        info: SignalInfo
+            The information related to this channel and connection.
+        """
+        info = SignalInfo(
+            address=address,
+            signal_name=signal_name,
+            connected=False,
+            severity=AlarmLevel.INVALID,
+            alarm_update_hook=self.update_current_alarm,
+        )
+        self.signal_info[self._channel] = info
+        self._channels.append(info.channel)
+        info.channel.connect()
+        return info
 
     def _tx(self, value):
         """Receive information from happi channel"""
@@ -263,20 +286,11 @@ class TyphosAlarm(TyphosObject, PyDMDrawing, _KindLevel, _AlarmLevel):
                 register_signal(sig)
 
         for ch_addr, sig in zip(channel_addrs, sigs):
-            info = SignalInfo(
-                address=ch_addr,
-                signal_name=sig.dotted_name,
-                connected=False,
-                severity=AlarmLevel.INVALID,
-                alarm_update_hook=self.update_current_alarm,
-            )
-            self.signal_info[ch_addr] = info
+            info = self.add_channel(address=ch_addr, signal_name=sig.dotted_name)
             self.device_info[device.name].append(info)
-            self._channels.append(info.channel)
-            info.channel.connect()
 
         all_channels = self.channels()
-        if all_channels:
+        if channel_addrs and all_channels:
             logger.debug(
                 f'Finished setup of alarm config for device {device.name} on '
                 f'alarm widget with new channels {channel_addrs}.'
